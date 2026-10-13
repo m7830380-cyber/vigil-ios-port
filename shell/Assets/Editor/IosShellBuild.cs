@@ -137,6 +137,7 @@ public static class IosShellBuild
         foreach (var f in new[] { "ARKit.framework", "GameController.framework", "AVFoundation.framework", "AudioToolbox.framework", "Accelerate.framework", "CoreMedia.framework" })
             proj.AddFrameworkToProject(fw, f, false);
         proj.AddBuildProperty(fw, "OTHER_LDFLAGS", "-lc++");
+        proj.AddBuildProperty(fw, "OTHER_LDFLAGS", "-lz");   // Steam Audio's libmysofa (HRTF loader) uses zlib
         foreach (var guid in new[] { main, fw })
         {
             proj.SetBuildProperty(guid, "CODE_SIGNING_ALLOWED", "NO");
