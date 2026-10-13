@@ -186,6 +186,8 @@ jobs:
           echo "app: $APP"
           rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
           APP="Payload/$(basename "$APP")"
+          # static libraries are linked into UnityFramework; Xcode also copies them into the bundle (7 MB waste)
+          find "$APP" -name '*.a' -print -delete
           cat > ent.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

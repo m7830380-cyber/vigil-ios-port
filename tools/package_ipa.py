@@ -1,94 +1,83 @@
-"""Build the final PeoplePlayground.ipa from the CI shell IPA plus the converted game data.
+"""Make the two files that go on the iPhone.
 
-  python tools/package_ipa.py [--work work] [--shell path/to/PPG-shell.ipa]
+  python tools/package_ipa.py [--work C:/Users/<you>/vigil-work] [--shell path/to/Vigil-shell.ipa] [--serve]
 
-Without --shell the `shell-latest` release of the PRIVATE repo is downloaded with the GitHub CLI.
-Output: work/PeoplePlayground.ipa (install with TrollStore). Never upload it anywhere public.
+  * Vigil.ipa       - the app (player + patched game code + FMOD / Steam Audio), from the `shell-latest`
+                      release of the PRIVATE repo (downloaded with the GitHub CLI unless --shell is given).
+                      Install it with TrollStore.
+  * VigilData.zip   - the converted game data (tools/convert_data.py -> <work>/VigilData), stored without
+                      compression (the data is already compressed). In the Files app put it in
+                      On My iPhone > VIGIL and tap it; the app finds the unpacked folder by itself.
+--serve starts a small web server on this PC so both files can be downloaded with Safari over Wi-Fi.
+Both files contain game-derived data: never upload them anywhere public.
 """
-import argparse, json, os, shutil, subprocess, zipfile
+import argparse, functools, http.server, os, shutil, socket, subprocess, sys, zipfile
 
-PRIVATE_REPO = 'm7830380-cyber/ppg-ios-private'
-SHELL_ASSET = 'PPG-shell.ipa'
-# Player data files that come from the retail game (converted). Everything else in Data/ (IL2CPP
-# metadata, "unity default resources", ScriptingAssemblies.json, ...) is the iOS shell's own.
-RETAIL_PREFIXES = ('level', 'sharedassets', 'resources.', 'globalgamemanagers')
-STORE_EXT = ('.resS', '.resource', '.assets', '.ttf')
+PRIVATE_REPO = 'm7830380-cyber/vigil-ios-private'
+SHELL_ASSET = 'Vigil-shell.ipa'
+ZIP_ROOT = 'VigilData'
 
 
-def find_app(payload):
-    for n in os.listdir(payload):
-        if n.endswith('.app'):
-            return os.path.join(payload, n)
-    raise SystemExit('no .app in shell ipa')
+def zip_data(src, out):
+    tmp = out + '.tmp'
+    n = 0
+    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED, allowZip64=True) as z:
+        for root, dirs, files in os.walk(src):
+            dirs.sort()
+            for f in sorted(files):
+                p = os.path.join(root, f)
+                z.write(p, (ZIP_ROOT + '/' + os.path.relpath(p, src)).replace('\\', '/'))
+                n += 1
+    os.replace(tmp, out)
+    return n
 
 
-def merge_rtiol(app_data, retail_json):
-    """Union of RuntimeInitializeOnLoads.json from retail and shell (the shell adds PPGiOS)."""
-    p_shell = os.path.join(app_data, 'RuntimeInitializeOnLoads.json')
-    if not os.path.exists(retail_json):
-        return
-    shell = json.load(open(p_shell)) if os.path.exists(p_shell) else {'root': []}
-    retail = json.load(open(retail_json))
-    seen = {(e['assemblyName'], e['nameSpace'], e['className'], e['methodName']) for e in shell['root']}
-    added = 0
-    for e in retail['root']:
-        k = (e['assemblyName'], e['nameSpace'], e['className'], e['methodName'])
-        if k not in seen:
-            shell['root'].append(e)
-            seen.add(k)
-            added += 1
-    json.dump(shell, open(p_shell, 'w'))
-    print('RuntimeInitializeOnLoads: %d entries (+%d from retail)' % (len(shell['root']), added))
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))     # no packet is sent; picks the interface of the default route
+        return s.getsockname()[0]
+    finally:
+        s.close()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--work', default='work')
+    ap.add_argument('--work', default=os.path.join(os.path.expanduser('~'), 'vigil-work'))
     ap.add_argument('--shell')
+    ap.add_argument('--serve', action='store_true')
+    ap.add_argument('--port', type=int, default=8642)
     a = ap.parse_args()
 
-    shell = a.shell
-    if not shell:
-        shell = os.path.join(a.work, SHELL_ASSET)
-        if os.path.exists(shell):
-            os.remove(shell)
-        subprocess.check_call(['gh', 'release', 'download', 'shell-latest', '--repo', PRIVATE_REPO,
-                               '-p', SHELL_ASSET, '-D', a.work])
+    out_dir = os.path.join(a.work, 'deliver')
+    os.makedirs(out_dir, exist_ok=True)
+    ipa = os.path.join(out_dir, 'Vigil.ipa')
+    if a.shell:
+        shutil.copyfile(a.shell, ipa)
+    else:
+        dl = os.path.join(a.work, 'dl-shell')
+        shutil.rmtree(dl, ignore_errors=True)
+        subprocess.check_call(['gh', 'release', 'download', 'shell-latest', '--repo', PRIVATE_REPO, '-p', SHELL_ASSET, '-D', dl])
+        os.replace(os.path.join(dl, SHELL_ASSET), ipa)
+        shutil.rmtree(dl, ignore_errors=True)
+    with zipfile.ZipFile(ipa) as z:
+        bad = z.testzip()
+        if bad:
+            sys.exit('broken ipa entry: %s' % bad)
+    print('app :', ipa, '%.0f MB' % (os.path.getsize(ipa) / 2 ** 20))
 
-    stage = os.path.join(a.work, 'ipa_stage')
-    shutil.rmtree(stage, ignore_errors=True)
-    with zipfile.ZipFile(shell) as z:
-        z.extractall(stage)
-    app = find_app(os.path.join(stage, 'Payload'))
-    data = os.path.join(app, 'Data')
-    print('shell app:', app)
+    data = os.path.join(a.work, 'VigilData')
+    if not os.path.exists(os.path.join(data, 'globalgamemanagers')):
+        sys.exit('no converted data in %s - run tools/convert_data.py first' % data)
+    dz = os.path.join(out_dir, 'VigilData.zip')
+    n = zip_data(data, dz)
+    print('data:', dz, '%.2f GB, %d files' % (os.path.getsize(dz) / 2 ** 30, n))
 
-    for n in os.listdir(data):
-        if n.startswith(RETAIL_PREFIXES):
-            os.remove(os.path.join(data, n))
-    conv = os.path.join(a.work, 'Data')
-    copied = 0
-    for root, _, files in os.walk(conv):
-        for f in files:
-            src = os.path.join(root, f)
-            dst = os.path.join(data, os.path.relpath(src, conv))
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copyfile(src, dst)
-            copied += 1
-    print('copied %d converted data files' % copied)
-    merge_rtiol(data, os.path.join(a.work, 'retail-RuntimeInitializeOnLoads.json'))
-
-    out = os.path.join(a.work, 'PeoplePlayground.ipa')
-    if os.path.exists(out):
-        os.remove(out)
-    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=6) as z:
-        for root, dirs, files in os.walk(os.path.join(stage, 'Payload')):
-            for f in files:
-                p = os.path.join(root, f)
-                arc = os.path.relpath(p, stage).replace('\\', '/')
-                ct = zipfile.ZIP_STORED if f.endswith(STORE_EXT) else zipfile.ZIP_DEFLATED
-                z.write(p, arc, compress_type=ct)
-    print('wrote', out, os.path.getsize(out) >> 20, 'MB')
+    if a.serve:
+        url = 'http://%s:%d/' % (lan_ip(), a.port)
+        print('\nOn the iPhone (same Wi-Fi), open in Safari:\n  %sVigil.ipa\n  %sVigilData.zip\nCtrl+C to stop.' % (url, url))
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=out_dir)
+        http.server.ThreadingHTTPServer(('', a.port), handler).serve_forever()
 
 
 if __name__ == '__main__':

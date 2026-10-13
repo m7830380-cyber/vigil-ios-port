@@ -1,14 +1,19 @@
-"""Convert a Unity 2020.3 Shader typetree (with DX11 programs) to a Metal-only Shader typetree.
+"""Convert a Unity 6 (6000.0) Shader typetree with DX11 programs to a Metal-only Shader typetree.
 
-2020.3 keeps one flat m_SubPrograms list per program stage that mixes all graphics APIs; each entry
-points (m_BlobIndex) into the decompressed blob of its API's platform and carries its parameters both in
-the typetree (m_ConstantBuffers, m_TextureParams, ... by m_NameIndices) and at the end of the blob
-segment (see blob2020.py). DX11 vertex/pixel programs are translated with HLSLcc (hlslcc_cli) to MSL,
-OpenGL/Vulkan programs are dropped, and the shader is re-tagged to the single platform Metal (14).
+Unity 6 layout (same blob version as 2022.3, see ukblob.py):
+  * each program stage has m_PlayerSubPrograms[4] (one list per graphics tier; Windows uses only slot 3,
+    iOS players look in slots 0..2) and the parallel m_ParameterBlobIndices[4];
+  * every entry points (m_BlobIndex) at a code segment and (parameter blob index) at a parameter segment of
+    the per-platform blob; shared cbuffer layouts / bindings live in m_CommonParameters.
+DX11 vertex/pixel programs are translated with HLSLcc (hlslcc_cli) to MSL. For every translated program a
+self-contained Metal parameter segment is written (Metal cbuffer names / offsets differ from DX11), so the
+common parameters are cleared. Geometry/hull/domain programs have no Metal equivalent and are dropped.
+The Metal code header (0xF00DCAFE, version 7) and its flags were measured from the shell's own Unity 6
+iOS shaders (unity_builtin_extra): 37 normally, 39 for vertex programs that write render_target_array_index.
 """
-import os, re, json, struct, subprocess, copy
+import os, re, json, struct, subprocess, copy, hashlib
 import lz4.block
-from blob2020 import read_sub, write_sub, SUB_VERSION
+from ukblob import read_params, write_params, read_sub, write_sub
 from dx2metal import merge_params, prep_dxbc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,57 +22,66 @@ _UK_HLSLCC = os.path.join(os.path.dirname(os.path.dirname(HERE)), 'ultrakill-ios
 HLSLCC = os.environ.get('HLSLCC_CLI') or next(
     (p for p in (os.path.join(HERE, 'hlslcc_cli', 'build', 'Release', 'hlslcc_cli.exe'), _UK_HLSLCC) if os.path.exists(p)),
     'hlslcc_cli')
+BLOB_VERSION = 202012090
 PLATFORM_D3D11, PLATFORM_METAL = 4, 14
+DX_TYPES = set(range(15, 23))
 DX_VS = {15, 16}
 DX_PS = {17, 18}
-DX_TYPES = set(range(15, 23))
 METAL_VS, METAL_FS = 23, 24
 HLSLCC_FLAGS = 0x20000 | 0x80000   # TRANSLATE_MATRICES | METAL_SHADOW_SAMPLER_LINEAR
-# Hardware tiers the converted programs are emitted for (Windows stores DX11 programs once, tier 3 = any).
-# Overridden by convert_data.py from what the iOS reference shaders use.
-METAL_TIERS = [3]
-# Metal code header (Unity "MetalShaderBlob" prefix) - set from the reference; None = raw MSL source.
-METAL_CODE_HEADER = None
-
-SEM_SRC = {'POSITION': 0, 'NORMAL': 1, 'TANGENT': 2, 'COLOR': 3, 'BLENDWEIGHTS': 12, 'BLENDWEIGHT': 12, 'BLENDINDICES': 13}
-# GPU-instancing variants (struct arrays in cbuffers) are dropped and the passes marked non-instanced;
-# Unity then falls back to regular / dynamic batching, which is what 2D sprites use anyway.
-INSTANCING_KW = {'INSTANCING_ON', 'PROCEDURAL_INSTANCING_ON', 'STEREO_INSTANCING_ON'}
+METAL_TIER_SLOTS = 3               # iOS: tiers 0..2 get the same programs, slot 3 stays empty
 PROGS = ('progVertex', 'progFragment', 'progGeometry', 'progHull', 'progDomain', 'progRayTracing')
+SEM_SRC = {'POSITION': 0, 'NORMAL': 1, 'TANGENT': 2, 'COLOR': 3, 'BLENDWEIGHTS': 12, 'BLENDWEIGHT': 12, 'BLENDINDICES': 13}
 
 
 class ConvertError(Exception):
     pass
 
 
-def metal_code(msl):
-    if METAL_CODE_HEADER is None:
-        return msl
-    return METAL_CODE_HEADER(msl)
+def metal_code(msl, is_vs):
+    name = b'xlatMtlMain\0'
+    flags = 37
+    if is_vs and b'render_target_array_index' in msl:
+        flags |= 2
+    hdr = struct.pack('<IIIIIIIIIiiI', 0xF00DCAFE, 48, 7, 48 + len(name), 0, 0, 0, 0, 0, flags, -1, 0)
+    return hdr + name + msl
 
 
-def platform_data(tt, blob, plat):
-    pi = tt['platforms'].index(plat)
-    parts = []
+# ---------------- platform blob io ----------------
+def platform_chunks(tt, blob, pi):
+    out = []
     for j in range(len(tt['offsets'][pi])):
         o, cl, dl = tt['offsets'][pi][j], tt['compressedLengths'][pi][j], tt['decompressedLengths'][pi][j]
-        parts.append(lz4.block.decompress(blob[o:o + cl], uncompressed_size=dl))
-    return b''.join(parts)
+        out.append(lz4.block.decompress(blob[o:o + cl], uncompressed_size=dl))
+    return out
 
 
-def segment(data, idx):
-    o, l, _ = struct.unpack_from('<iii', data, 4 + 12 * idx)
-    return data[o:o + l]
+def entries_of(chunks):
+    d = chunks[0]
+    n = struct.unpack_from('<i', d, 0)[0]
+    return [struct.unpack_from('<iii', d, 4 + 12 * k) for k in range(n)]
 
 
-def join_segments(segs):
-    hdr = 4 + 12 * len(segs)
-    out = bytearray(struct.pack('<i', len(segs)))
-    body = bytearray()
+def get_seg(chunks, ent):
+    o, l, s = ent
+    return chunks[s][o:o + l]
+
+
+def pack_platform(segs, chunk_limit=48 << 20):
+    """Segments -> raw chunks, entry table (offset, length, chunk) at the start of chunk 0."""
+    n = len(segs)
+    table = 4 + 12 * n
+    chunks = [bytearray(table)]
+    ents = []
     for s in segs:
-        out += struct.pack('<iii', hdr + len(body), len(s), 0)
-        body += s
-    return bytes(out + body)
+        if len(chunks[-1]) + len(s) > chunk_limit and len(chunks[-1]) > (table if len(chunks) == 1 else 0):
+            chunks.append(bytearray())
+        ents.append((len(chunks[-1]), len(s), len(chunks) - 1))
+        chunks[-1] += s
+    struct.pack_into('<i', chunks[0], 0, n)
+    for k, e in enumerate(ents):
+        struct.pack_into('<iii', chunks[0], 4 + 12 * k, *e)
+    return [bytes(c) for c in chunks]
 
 
 # ---------------- reflection -> metal params ----------------
@@ -84,7 +98,7 @@ def metal_layout(c):
 
 
 def build_metal_params(refl, msl, P, cbname_map):
-    """HLSLcc reflection + original DX params -> (cbs, binds) in blob form (first cb is the empty '' one)."""
+    """HLSLcc reflection + original DX params -> Metal parameter segment."""
     orig_vars = {}
     for cn, cb in P['cbs'].items():
         for v in cb['vars']:
@@ -119,7 +133,7 @@ def build_metal_params(refl, msl, P, cbname_map):
             off += size
             cur['size'] = off
         elif k == 'cbbind':
-            binds.append(dict(kind='cb', name=r['name'], index=r['index'], arraySize=0))
+            binds.append(dict(kind='cb', name=r['name'], index=r['index'], arraySize=1))
         elif k == 'tex':
             if r['uav']:
                 ou = next((u for u in P['uav'] if u['name'] == r['name']), None)
@@ -142,7 +156,7 @@ def build_metal_params(refl, msl, P, cbname_map):
         s = next((x for x in P['samplers'] if x['bind'] == int(m.group(1))), None)
         if s is not None:
             binds.append(dict(kind='sampler', name='', bind=int(m.group(2)), sampler=s['sampler']))
-    return cbs, binds
+    return write_params(dict(version=BLOB_VERSION, cbs=cbs, binds=binds, tail=b''))
 
 
 def vertex_channels(refl):
@@ -170,66 +184,6 @@ def fix_msl(msl, is_vs):
     return msl
 
 
-# ---------------- typetree params ----------------
-class Names:
-    """A pass's m_NameIndices with the ability to add names."""
-    def __init__(self, pairs):
-        self.idx = {n: i for n, i in pairs}
-        self.next = max(self.idx.values(), default=-1) + 1
-
-    def __call__(self, name):
-        if name not in self.idx:
-            self.idx[name] = self.next
-            self.next += 1
-        return self.idx[name]
-
-    def pairs(self):
-        return sorted(self.idx.items())
-
-
-def tt_params(cbs, binds, N):
-    """(cbs, binds) blob form -> typetree subprogram parameter fields."""
-    def split(params):
-        vec, mat = [], []
-        for p in params:
-            if p['isMatrix']:
-                mat.append(dict(m_NameIndex=N(p['name']), m_Index=p['index'], m_ArraySize=p['arraySize'],
-                                m_Type=p['type'], m_RowCount=p['rows']))
-            else:
-                vec.append(dict(m_NameIndex=N(p['name']), m_Index=p['index'], m_ArraySize=p['arraySize'],
-                                m_Type=p['type'], m_Dim=p['cols']))
-        return vec, mat
-
-    out = dict(m_VectorParams=[], m_MatrixParams=[], m_TextureParams=[], m_BufferParams=[], m_ConstantBuffers=[],
-               m_ConstantBufferBindings=[], m_UAVParams=[], m_Samplers=[])
-    for cb in cbs:
-        vec, mat = split(cb['params'])
-        if cb['name'] == '':
-            out['m_VectorParams'], out['m_MatrixParams'] = vec, mat
-            continue
-        structs = []
-        for st in cb['structs']:
-            svec, smat = split(st['params'])
-            structs.append(dict(m_NameIndex=N(st['name']), m_Index=st['index'], m_ArraySize=st['arraySize'],
-                                m_StructSize=st['size'], m_VectorMembers=svec, m_MatrixMembers=smat))
-        out['m_ConstantBuffers'].append(dict(m_NameIndex=N(cb['name']), m_MatrixParams=mat, m_VectorParams=vec,
-                                             m_StructParams=structs, m_Size=cb['size']))
-    for b in binds:
-        k = b['kind']
-        if k == 'tex':
-            out['m_TextureParams'].append(dict(m_NameIndex=N(b['name']), m_Index=b['index'], m_SamplerIndex=b['sampler'],
-                                               m_MultiSampled=bool(b['extra'] & 1), m_Dim=b['extra'] >> 1))
-        elif k == 'cb':
-            out['m_ConstantBufferBindings'].append(dict(m_NameIndex=N(b['name']), m_Index=b['index'], m_ArraySize=1))
-        elif k == 'buf':
-            out['m_BufferParams'].append(dict(m_NameIndex=N(b['name']), m_Index=b['index'], m_ArraySize=b['arraySize']))
-        elif k == 'uav':
-            out['m_UAVParams'].append(dict(m_NameIndex=N(b['name']), m_Index=b['index'], m_OriginalIndex=b['orig']))
-        elif k == 'sampler':
-            out['m_Samplers'].append(dict(sampler=b['sampler'], bindPoint=b['bind']))
-    return out
-
-
 # ---------------- hlslcc batch ----------------
 class HlslccBatch:
     def __init__(self, workdir):
@@ -251,10 +205,9 @@ class HlslccBatch:
         nproc = max(1, min(nproc or (os.cpu_count() or 2) - 1, len(self.jobs)))
         procs = []
         for i in range(nproc):
-            part = self.jobs[i::nproc]
             lf = os.path.join(self.dir, 'list%d.txt' % i)
             with open(lf, 'w') as f:
-                f.writelines(self._line(k) for k in part)
+                f.writelines(self._line(k) for k in self.jobs[i::nproc])
             procs.append(subprocess.Popen([HLSLCC, lf], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL))
         for p in procs:
             p.wait()
@@ -281,106 +234,118 @@ def convert_shader(tt, blob, workdir, log=print):
     Returns (new typetree incl. compressedBlob, stats) or None when the shader has no DX11 programs."""
     if PLATFORM_D3D11 not in tt['platforms']:
         return None
-    dx = platform_data(tt, blob, PLATFORM_D3D11)
+    pi = tt['platforms'].index(PLATFORM_D3D11)
+    chunks = platform_chunks(tt, blob, pi)
+    ents = entries_of(chunks)
     name = tt['m_ParsedForm']['m_Name']
     batch = HlslccBatch(workdir)
-    plan = {}       # dx blob index -> (key, P, sub, is_vs)
-    stats = dict(ok=0, fail=0, dropped=0, instancing=0)
-    for ss in tt['m_ParsedForm']['m_SubShaders']:
-        for p in ss['m_Passes']:
+    plan = []       # (key, P, sub, is_vs)
+    keymap = {}     # (subshader, pass, prog, blob index, param index) -> key or None
+    by_digest = {}  # sha1 of the prepared DXBC -> key
+    stats = dict(ok=0, fail=0, dropped=0)
+    for si, ss in enumerate(tt['m_ParsedForm']['m_SubShaders']):
+        for pa, p in enumerate(ss['m_Passes']):
+            names = {v: k for k, v in p['m_NameIndices']}
             for prog in PROGS:
-                for e in p[prog]['m_SubPrograms']:
-                    t = e['m_GpuProgramType']
-                    if t not in DX_TYPES:
-                        continue
-                    if t not in DX_VS | DX_PS:
-                        stats['dropped'] += 1
-                        continue
-                    bi = e['m_BlobIndex']
-                    if bi in plan:
-                        continue
-                    key = 'b%d' % bi
-                    try:
-                        sub = read_sub(segment(dx, bi))
-                        if INSTANCING_KW & set(sub['globalKw'] + sub['localKw']):
-                            plan[bi] = 'instancing'
+                pr = p[prog]
+                for slot, lst in enumerate(pr['m_PlayerSubPrograms']):
+                    for ei, e in enumerate(lst):
+                        t = e['m_GpuProgramType']
+                        if t not in DX_TYPES:
                             continue
-                        P = merge_params(None, {}, dict(cbs=sub['cbs'], binds=sub['binds']))
-                        code, _ = prep_dxbc(sub['code'], P)
-                        batch.add(key, code)
-                        plan[bi] = (key, P, sub, t in DX_VS)
-                    except Exception as ex:
-                        plan[bi] = None
-                        log('  [%s] prep failed: %r' % (name, ex))
+                        if t not in DX_VS | DX_PS:
+                            stats['dropped'] += 1
+                            continue
+                        pbl = pr['m_ParameterBlobIndices'][slot] if slot < len(pr['m_ParameterBlobIndices']) else []
+                        pbi = pbl[ei] if pbl else -1
+                        ck = (si, pa, prog, e['m_BlobIndex'], pbi)
+                        if ck in keymap:
+                            continue
+                        key = 'k%d' % len(keymap)
+                        keymap[ck] = key
+                        try:
+                            bp = read_params(get_seg(chunks, ents[pbi])) if pbi >= 0 else None
+                            P = merge_params(pr['m_CommonParameters'], names, bp)
+                            sub = read_sub(get_seg(chunks, ents[e['m_BlobIndex']]))
+                            dx, _ = prep_dxbc(sub['code'], P)
+                            dig = hashlib.sha1(dx).hexdigest()   # passes often share identical programs
+                            if dig in by_digest:
+                                keymap[ck] = by_digest[dig]
+                                continue
+                            by_digest[dig] = key
+                            batch.add(key, dx)
+                            plan.append((key, P, sub, t in DX_VS))
+                        except Exception as ex:
+                            keymap[ck] = None
+                            stats['fail'] += 1
+                            log('  [%s] prep failed: %r' % (name, ex))
     batch.run()
 
     segs = []
-    results = {}    # dx blob index -> (metal blob index, cbs, binds, channels, sourceMap)
-    for bi, item in plan.items():
-        if item == 'instancing':
-            stats['instancing'] += 1
-            continue
-        if item is None:
-            stats['fail'] += 1
-            continue
-        key, P, sub, is_vs = item
+    results = {}    # key -> (code segment index, param segment index)
+    for key, P, sub, is_vs in plan:
         msl, refl = batch.result(key)
         if msl is None:
             stats['fail'] += 1
-            log('  [%s] hlslcc failed for blob %d%s' % (name, bi, (': ' + str(refl.get('err', ''))[:200]) if refl else ''))
+            log('  [%s] hlslcc failed%s' % (name, (': ' + str([d['msg'] for d in refl['refl'] if d['k'] == 'diag'])[:300]) if refl else ' (crash)'))
             continue
         try:
             msl = fix_msl(msl, is_vs)
-            cbs, binds = build_metal_params(refl, msl, P, {'VGlobals': '$Globals'} if is_vs else {'FGlobals': '$Globals'})
-            smap, ch = vertex_channels(refl) if is_vs else (sub['sourceMap'], [])
-            msub = dict(version=SUB_VERSION, type=METAL_VS if is_vs else METAL_FS, stats=list(sub['stats']),
-                        globalKw=sub['globalKw'], localKw=sub['localKw'], code=metal_code(msl),
-                        sourceMap=smap, channels=ch, cbs=cbs, binds=binds, tail=b'')
+            pseg = build_metal_params(refl, msl, P, {'VGlobals': '$Globals'} if is_vs else {'FGlobals': '$Globals'})
+            smap, ch = vertex_channels(refl) if is_vs else (0, [])
+            msub = dict(version=BLOB_VERSION, type=METAL_VS if is_vs else METAL_FS, stats=[0, 0, 0, 0],
+                        keywords=sub['keywords'], code=metal_code(msl, is_vs), sourceMap=smap, channels=ch, tail=b'')
+            segs.append(pseg)
             segs.append(write_sub(msub))
-            results[bi] = (len(segs) - 1, cbs, binds, ch, smap)
+            results[key] = (len(segs) - 1, len(segs) - 2)
             stats['ok'] += 1
         except Exception as ex:
             stats['fail'] += 1
             log('  [%s] build failed: %r' % (name, ex))
 
     nt = copy.deepcopy(tt)
-    for ss in nt['m_ParsedForm']['m_SubShaders']:
-        for p in ss['m_Passes']:
-            if p['m_Platforms']:
+    for si, ss in enumerate(nt['m_ParsedForm']['m_SubShaders']):
+        for pa, p in enumerate(ss['m_Passes']):
+            if p.get('m_Platforms'):
                 p['m_Platforms'] = [PLATFORM_METAL] if PLATFORM_D3D11 in p['m_Platforms'] else []
-            N = Names(p['m_NameIndices'])
+            # A pass that needs geometry/tessellation stages cannot run without them: leave it without programs,
+            # as Unity's own Metal build does (the subshader is then skipped / falls back).
+            needs_missing = any(e['m_GpuProgramType'] in DX_TYPES - DX_VS - DX_PS
+                                for prog in PROGS for lst in p[prog]['m_PlayerSubPrograms'] for e in lst)
             for prog in PROGS:
                 pr = p[prog]
-                out = []
-                for e in pr['m_SubPrograms']:
-                    if e['m_GpuProgramType'] not in DX_VS | DX_PS:
-                        continue
-                    r = results.get(e['m_BlobIndex'])
-                    if r is None:
-                        continue
-                    mi, cbs, binds, ch, smap = r
-                    ne = dict(e)
-                    ne.update(tt_params(cbs, binds, N))
-                    ne['m_BlobIndex'] = mi
-                    ne['m_GpuProgramType'] = METAL_VS if e['m_GpuProgramType'] in DX_VS else METAL_FS
-                    ne['m_Channels'] = dict(m_Channels=[dict(source=s, target=t) for s, t in ch], m_SourceMap=smap)
-                    for tier in METAL_TIERS:
-                        te = dict(ne)
-                        te['m_ShaderHardwareTier'] = tier
-                        out.append(te)
-                pr['m_SubPrograms'] = out
-            p['m_NameIndices'] = N.pairs()
-            if stats['instancing']:
-                p['m_HasInstancingVariant'] = False
-                p['m_HasProceduralInstancingVariant'] = False
+                subs, pars = [], []
+                for slot, lst in enumerate(pr['m_PlayerSubPrograms'] if not needs_missing else []):
+                    pbl = pr['m_ParameterBlobIndices'][slot] if slot < len(pr['m_ParameterBlobIndices']) else []
+                    for ei, e in enumerate(lst):
+                        if e['m_GpuProgramType'] not in DX_VS | DX_PS:
+                            continue
+                        key = keymap.get((si, pa, prog, e['m_BlobIndex'], pbl[ei] if pbl else -1))
+                        r = results.get(key) if key else None
+                        if r is None:
+                            continue
+                        ne = dict(e)
+                        ne['m_BlobIndex'] = r[0]
+                        ne['m_GpuProgramType'] = METAL_VS if e['m_GpuProgramType'] in DX_VS else METAL_FS
+                        subs.append(ne)
+                        pars.append(r[1])
+                if pr['m_PlayerSubPrograms']:
+                    pr['m_PlayerSubPrograms'] = [list(subs) for _ in range(METAL_TIER_SLOTS)] + [[]]
+                    pr['m_ParameterBlobIndices'] = [list(pars) for _ in range(METAL_TIER_SLOTS)] + [[]]
+                for k in pr['m_CommonParameters']:
+                    pr['m_CommonParameters'][k] = []
 
-    raw = join_segments(segs)
-    comp = lz4.block.compress(raw, store_size=False, mode='high_compression')
+    raw = pack_platform(segs)
+    comp = [lz4.block.compress(c, store_size=False, mode='high_compression') for c in raw]
+    offs, o = [], 0
+    for c in comp:
+        offs.append(o)
+        o += len(c)
     nt['platforms'] = [PLATFORM_METAL]
-    nt['offsets'] = [[0]]
-    nt['compressedLengths'] = [[len(comp)]]
-    nt['decompressedLengths'] = [[len(raw)]]
-    nt['compressedBlob'] = comp
-    log('  [%s] variants ok=%d fail=%d dropped(non vs/ps)=%d instancing=%d'
-        % (name, stats['ok'], stats['fail'], stats['dropped'], stats['instancing']))
+    nt['offsets'] = [offs]
+    nt['compressedLengths'] = [[len(c) for c in comp]]
+    nt['decompressedLengths'] = [[len(c) for c in raw]]
+    nt['stageCounts'] = [tt['stageCounts'][pi]] if tt.get('stageCounts') else []
+    nt['compressedBlob'] = b''.join(comp)
+    log('  [%s] variants ok=%d fail=%d dropped(non vs/ps)=%d' % (name, stats['ok'], stats['fail'], stats['dropped']))
     return nt, stats

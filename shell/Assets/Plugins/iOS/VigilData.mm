@@ -30,6 +30,18 @@ static NSString *VigilFindContent(NSString *docs)
         NSString *p = [docs stringByAppendingPathComponent:c];
         if ([fm fileExistsAtPath:[p stringByAppendingPathComponent:@"globalgamemanagers"]]) return p;
     }
+    // anything else up to two levels deep ("VigilData 2" from the Files app when VigilData already exists, ...)
+    for (NSString *a in [[fm contentsOfDirectoryAtPath:docs error:nil] sortedArrayUsingSelector:@selector(compare:)])
+    {
+        NSString *pa = [docs stringByAppendingPathComponent:a];
+        if ([a hasPrefix:@"."] || [a isEqualToString:@"Inbox"]) continue;
+        if ([fm fileExistsAtPath:[pa stringByAppendingPathComponent:@"globalgamemanagers"]]) return pa;
+        for (NSString *b in [fm contentsOfDirectoryAtPath:pa error:nil])
+        {
+            NSString *pb = [pa stringByAppendingPathComponent:b];
+            if ([fm fileExistsAtPath:[pb stringByAppendingPathComponent:@"globalgamemanagers"]]) return pb;
+        }
+    }
     return nil;
 }
 

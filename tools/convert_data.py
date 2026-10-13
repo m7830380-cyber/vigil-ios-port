@@ -1,167 +1,198 @@
-"""Convert retail People Playground (Windows) data so the iOS shell player can load it.
+"""Convert the retail VIGIL (Windows) data so the iOS player can load it.
 
-  python tools/convert_data.py [--game "C:/.../People Playground"] [--out work]
+  python tools/convert_data.py [--game "C:/.../Vigil"] [--out C:/Users/<you>/vigil-work]
 
-Produces work/Data/ (goes into the app's Data folder, see package_ipa.py). For every serialized file:
-  * the target-platform tag is changed from StandaloneWindows64 (19) to iOS (9)
-  * every Shader gets its DX11 programs translated to Metal (convert_shader.py)
-  * every BCn/DXT (and crunched) texture is re-encoded as ASTC 4x4 (transcode_tex.py)
-Audio / meshes / everything else stays as it is.
-Nothing produced here may be committed to the public repo - it is derived from the game.
+Produces <out>/VigilData/ - the folder the user copies to the app's Documents with Filza (see README).
+For every serialized player file:
+  * the target-platform tag changes from StandaloneWindows64 (19) to iOS (9);
+  * every Shader gets its DX11 programs translated to Metal (convert_shader.py);
+  * every ComputeShader gets its D3D11 kernels translated to Metal (convert_compute.py);
+  * BCn textures become ASTC, BC6H / half-float lightmaps ASTC HDR, 4096 maps 2048 (transcode_tex.py);
+  * .resS streams that hold re-encoded textures are rebuilt, all others are copied unchanged.
+StreamingAssets (FMOD banks, probe volume data) are copied, except PBP/ (the Windows blink helper).
+Resources/ is not produced: the iOS player brings its own "unity default resources" and an iOS-compiled
+unity_builtin_extra with the same objects (same path ids) as the retail one.
+
+Work is done one file at a time into <out>/VigilData, so the extra disk space is about the size of the
+result (~1.5 GB) plus a small shader cache. Nothing produced here may be committed to the public repo -
+it is derived from the game.
 """
 import argparse, hashlib, json, os, pickle, shutil, sys, time, traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import UnityPy
-import convert_shader
 from convert_shader import convert_shader as convert_one
-from transcode_tex import transcode_in
+from convert_compute import convert_compute
+from transcode_tex import transcode_file
 
+UnityPy.config.FALLBACK_UNITY_VERSION = '6000.0.26f1'
 IOS_PLATFORM = 9
-PLAYER_FILES = ['globalgamemanagers', 'globalgamemanagers.assets', 'level0', 'level1', 'level2', 'resources.assets',
-                'sharedassets0.assets', 'sharedassets1.assets', 'sharedassets2.assets', 'Resources/unity_builtin_extra']
-COPY_WITH = ['.resS', '.resource']
-DEFAULT_GAME = r'C:\Program Files (x86)\Steam\steamapps\common\People Playground'
-CONVERTER_VERSION = '3'   # bump to invalidate the shader cache
+PLAYER_FILES = ['globalgamemanagers', 'globalgamemanagers.assets', 'level0', 'level1', 'level2', 'level3',
+                'resources.assets', 'sharedassets0.assets', 'sharedassets1.assets', 'sharedassets2.assets',
+                'sharedassets3.assets']
+SKIP_STREAMING = {'PBP'}
+DEFAULT_GAME = r'C:\Program Files (x86)\Steam\steamapps\common\Vigil'
+CONVERTER_VERSION = 'vigil-1'   # bump to invalidate the shader cache
 
 
 def log(*a):
     print(time.strftime('%H:%M:%S'), *a, flush=True)
 
 
-def make_code_header(hdr):
-    """Declarative code header from metal_ref.json: {"kind": "prefix", "hex": "<bytes before the MSL source>"}."""
-    if hdr.get('kind') == 'prefix':
-        prefix = bytes.fromhex(hdr['hex'])
-        return lambda msl: prefix + (msl.encode() if isinstance(msl, str) else msl)
-    raise ValueError('unknown code_header kind: %r' % hdr.get('kind'))
-
-
-def load_metal_conventions(path):
-    """Settings measured from the shell's own (Unity-compiled) Metal shaders, see inspect_reference.py."""
-    if path and os.path.exists(path):
-        ref = json.load(open(path))
-        convert_shader.METAL_TIERS = ref.get('tiers', convert_shader.METAL_TIERS)
-        hdr = ref.get('code_header')
-        if hdr:
-            convert_shader.METAL_CODE_HEADER = make_code_header(hdr)
-    return convert_shader.METAL_TIERS, convert_shader.METAL_CODE_HEADER
-
-
-def shader_key(tt, blob):
+def cache_key(kind, name, blob):
     h = hashlib.sha1()
     h.update(CONVERTER_VERSION.encode())
-    h.update(json.dumps(convert_shader.METAL_TIERS).encode())
-    h.update(tt['m_ParsedForm']['m_Name'].encode())
+    h.update(kind.encode())
+    h.update(name.encode())
     h.update(blob)
     return h.hexdigest()
 
 
-def convert_shaders_in(objects, cache_dir, work_dir, report):
+def cached(cache_dir, key, make):
+    cp = os.path.join(cache_dir, key + '.pkl')
+    if os.path.exists(cp):
+        with open(cp, 'rb') as f:
+            return pickle.load(f)
+    res = make()
+    with open(cp, 'wb') as f:
+        pickle.dump(res, f)
+    return res
+
+
+def convert_shaders_in(sf, cache_dir, work_dir, report):
     n = 0
-    for obj in objects:
-        if obj.type.name != 'Shader':
+    for obj in sf.objects.values():
+        kind = obj.type.name
+        if kind not in ('Shader', 'ComputeShader'):
             continue
         tt = obj.read_typetree()
-        blob = bytes(tt['compressedBlob'])
-        name = tt['m_ParsedForm']['m_Name']
-        key = shader_key(tt, blob)
-        cp = os.path.join(cache_dir, key + '.pkl')
-        if os.path.exists(cp):
-            nt, stats = pickle.load(open(cp, 'rb'))
+        if kind == 'Shader':
+            blob = bytes(tt['compressedBlob'])
+            name = tt['m_ParsedForm']['m_Name']
         else:
-            tt['compressedBlob'] = b''
-            msgs = []
-            res = convert_one(tt, blob, os.path.join(work_dir, 'hlslcc', key), log=msgs.append)
-            if res is None:
-                report.setdefault('no_dx11', []).append(name)
-                continue
-            nt, stats = res
-            stats = dict(stats, msgs=msgs[:50])
-            pickle.dump((nt, stats), open(cp, 'wb'))
-            shutil.rmtree(os.path.join(work_dir, 'hlslcc', key), ignore_errors=True)
-        report.setdefault('shaders', {})[name] = {k: v for k, v in stats.items() if k != 'msgs'}
+            name = tt['m_Name']
+            blob = pickle.dumps(tt['variants'])
+        key = cache_key(kind, name, blob)
+        wd = os.path.join(work_dir, 'hlslcc', key)
+        msgs = []
+
+        def make():
+            if kind == 'Shader':
+                tt['compressedBlob'] = b''
+                r = convert_one(tt, blob, wd, log=msgs.append)
+            else:
+                r = convert_compute(tt, wd, log=msgs.append)
+            shutil.rmtree(wd, ignore_errors=True)
+            return r, msgs[:50]
+
+        res, msgs = cached(cache_dir, key, make)
+        if res is None:
+            report.setdefault('no_dx11', []).append(name)
+            continue
+        nt, stats = res
+        report.setdefault('compute_shaders' if kind == 'ComputeShader' else 'shaders', {})[name] = stats
         if stats.get('fail'):
-            report.setdefault('shader_msgs', {})[name] = stats.get('msgs', [])
+            report.setdefault('shader_msgs', {})[name] = msgs
         obj.save_typetree(nt)
         n += 1
     return n
 
 
-def process_player_file(src, dst, cache_dir, work_dir, ref):
-    load_metal_conventions(ref)
+def streams_of(src):
+    """Stream files that belong to a player file: <file>.resS and, for x.assets, x.resource."""
+    out = []
+    for p in (src + '.resS', os.path.splitext(src)[0] + '.resource', src + '.resource'):
+        if os.path.exists(p) and p not in out:
+            out.append(p)
+    return out
+
+
+def process_player_file(name, data, out_data, cache_dir, work_dir):
+    t0 = time.time()
     report = {}
+    src = os.path.join(data, name)
     env = UnityPy.load(src)
     sf = list(env.files.values())[0]
-    n = convert_shaders_in(sf.objects.values(), cache_dir, work_dir, report)
-    report['textures'] = transcode_in(sf.objects.values(), report)
+    report['shaders_converted'] = convert_shaders_in(sf, cache_dir, work_dir, report)
+    report['textures_converted'] = transcode_file(sf, data, out_data, report)
     sf._m_target_platform = IOS_PLATFORM
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    with open(dst, 'wb') as f:
+    dst = os.path.join(out_data, name)
+    with open(dst + '.tmp', 'wb') as f:
         f.write(sf.save())
-    # streamed data next to the file: <name>.resS / <name>.resource, and for "x.assets" also "x.resource"
-    # (audio: sharedassets0.assets -> sharedassets0.resource, resources.assets -> resources.resource)
-    for base_src, base_dst in {(src, dst), (os.path.splitext(src)[0], os.path.splitext(dst)[0])}:
-        for ext in COPY_WITH:
-            if os.path.exists(base_src + ext):
-                shutil.copyfile(base_src + ext, base_dst + ext)
-    return n, report
+    os.replace(dst + '.tmp', dst)
+    rebuilt = set(report.get('rebuilt_streams', []))
+    for s in streams_of(src):
+        rel = os.path.relpath(s, data)
+        if rel not in rebuilt:
+            shutil.copyfile(s, os.path.join(out_data, rel))
+    report['seconds'] = round(time.time() - t0)
+    return report
 
 
-def job(src, dst, cache_dir, work_dir, ref):
+def job(*args):
     try:
-        return process_player_file(src, dst, cache_dir, work_dir, ref)
+        return process_player_file(*args)
     except Exception:
-        return -1, {'error': traceback.format_exc()}
+        return {'error': traceback.format_exc()}
+
+
+def tree_size(p):
+    return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(p) for f in fs)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--game', default=DEFAULT_GAME)
-    ap.add_argument('--out', default='work')
-    ap.add_argument('--ref', default=None, help='metal_ref.json from inspect_reference.py')
-    ap.add_argument('--only', default=None, help='substring filter on file names (testing)')
-    ap.add_argument('--jobs', type=int, default=3)
+    ap.add_argument('--out', default=os.path.join(os.path.expanduser('~'), 'vigil-work'))
+    ap.add_argument('--only', default=None, help='comma separated player file names (testing)')
+    ap.add_argument('--jobs', type=int, default=2)
     a = ap.parse_args()
 
-    data = os.path.join(a.game, 'People Playground_Data')
-    out_data = os.path.join(a.out, 'Data')
+    data = os.path.join(a.game, 'Vigil_Data')
+    out_data = os.path.join(a.out, 'VigilData')
     cache_dir = os.path.join(a.out, 'cache', 'shaders')
     work_dir = os.path.join(a.out, 'tmp')
     os.makedirs(cache_dir, exist_ok=True)
-    ref = a.ref or os.path.join(a.out, 'metal_ref.json')
-    tiers, hdr = load_metal_conventions(ref)
-    log('metal tiers', tiers, 'code header', 'yes' if hdr else 'none (raw MSL)')
+    os.makedirs(out_data, exist_ok=True)
 
-    jobs = [(os.path.join(data, f), os.path.join(out_data, f)) for f in PLAYER_FILES if os.path.exists(os.path.join(data, f))]
+    files = [f for f in PLAYER_FILES if os.path.exists(os.path.join(data, f))]
     if a.only:
-        jobs = [j for j in jobs if a.only in j[0]]
-    jobs.sort(key=lambda j: -os.path.getsize(j[0]))
+        files = [f for f in files if f in a.only.split(',')]
+    files.sort(key=lambda f: -sum(os.path.getsize(s) for s in [os.path.join(data, f)] + streams_of(os.path.join(data, f))))
 
-    # StreamingAssets ship as Data/Raw
-    sa = os.path.join(data, 'StreamingAssets')
-    if os.path.isdir(sa) and not a.only:
-        shutil.copytree(sa, os.path.join(out_data, 'Raw'), dirs_exist_ok=True)
-    for f in ('RuntimeInitializeOnLoads.json', 'ScriptingAssemblies.json'):
-        if not a.only:
+    if not a.only:
+        sa = os.path.join(data, 'StreamingAssets')
+        dst_sa = os.path.join(out_data, 'StreamingAssets')
+        shutil.rmtree(dst_sa, ignore_errors=True)
+        shutil.copytree(sa, dst_sa, ignore=lambda d, names: [n for n in names if d == sa and n in SKIP_STREAMING])
+        for f in ('RuntimeInitializeOnLoads.json', 'ScriptingAssemblies.json'):
             shutil.copyfile(os.path.join(data, f), os.path.join(a.out, 'retail-' + f))
 
-    log('converting', len(jobs), 'files')
-    report = {}
+    log('converting', len(files), 'files with', a.jobs, 'jobs')
+    rp = os.path.join(a.out, 'convert_report.json')
+    report = json.load(open(rp)) if (a.only and os.path.exists(rp)) else {}
     t0 = time.time()
+    ok = True
     with ProcessPoolExecutor(max_workers=a.jobs) as ex:
-        futs = {ex.submit(job, src, dst, cache_dir, work_dir, ref): src for src, dst in jobs}
+        futs = {ex.submit(job, f, data, out_data, cache_dir, work_dir): f for f in files}
         for fu in as_completed(futs):
-            src = futs[fu]
-            n, rep = fu.result()
-            sh = rep.get('shaders', {})
-            bad = sum(1 for s in sh.values() if s.get('fail'))
-            log('done', os.path.relpath(src, data), 'shaders', n, 'with failures', bad, 'textures', rep.get('textures'),
-                'texture errors', len(rep.get('texture_errors', [])), rep.get('error', ''))
-            report[os.path.relpath(src, data)] = rep
-    json.dump(report, open(os.path.join(a.out, 'convert_report.json'), 'w'), indent=1)
-    log('finished in %.0fs' % (time.time() - t0))
+            f = futs[fu]
+            rep = fu.result()
+            report[f] = rep
+            if rep.get('error'):
+                ok = False
+                log('FAILED', f, rep['error'])
+                continue
+            sh = dict(rep.get('shaders', {}), **rep.get('compute_shaders', {}))
+            bad = sorted(n for n, s in sh.items() if s.get('fail'))
+            log('done %-26s %4ds  shaders %3d (with failures: %d)  textures %4d (errors %d)' % (
+                f, rep['seconds'], rep['shaders_converted'], len(bad), rep['textures_converted'],
+                len(rep.get('texture_errors', []))))
+            json.dump(report, open(rp, 'w'), indent=1)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    log('finished in %.0fs, VigilData is %.2f GB' % (time.time() - t0, tree_size(out_data) / 2 ** 30))
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == '__main__':

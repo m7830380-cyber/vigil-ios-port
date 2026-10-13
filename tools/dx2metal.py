@@ -91,7 +91,8 @@ def sampler_name_for_slot(P, slot):
     return None
 
 
-def build_rdef(P, sm_major, sm_minor, prog_tok, samplers_used=(), textures_used=()):
+def build_rdef(P, sm_major, sm_minor, prog_tok, samplers_used=(), textures_used=(), decls=None):
+    decls = decls or {}
     strings = bytearray()
     stroff = {}
     is5 = sm_major >= 5
@@ -117,17 +118,38 @@ def build_rdef(P, sm_major, sm_minor, prog_tok, samplers_used=(), textures_used=
         dim = SRV_DIM.get(t['dim'], 4)
         if t['ms'] and dim == 4:
             dim = 6
-        res.append((t['name'], 2, 5, dim, 0 if t['ms'] else 0xFFFFFFFF, t['index'], 1, 12))
+        d = decls.get(('t', t['index']))
+        if d and d[0] == 2:
+            dim = d[1]
+        res.append((t['name'], 2, d[2] if d and d[0] == 2 else 5, dim, 0 if t['ms'] else 0xFFFFFFFF, t['index'], 1, 12))
     for b in P['buf']:
-        res.append((b['name'], 5, 6, 1, 0, b['index'], 1, 0))
+        d = decls.get(('t', b['index']))
+        if d:
+            res.append((b['name'], d[0], d[2], d[1], 0 if d[0] != 2 else 0xFFFFFFFF, b['index'], 1, 12 if d[0] == 2 else 0))
+        else:
+            res.append((b['name'], 5, 6, 1, 0, b['index'], 1, 0))
     for u in P['uav']:
-        res.append((u['name'], 6, 6, 1, 0, u['index'], 1, 0))
+        d = decls.get(('u', u['index']))
+        if d:
+            res.append((u['name'], d[0], d[2], d[1], 0 if d[0] != 4 else 0xFFFFFFFF, u['index'], 1, 12 if d[0] == 4 else 0))
+        else:
+            res.append((u['name'], 6, 6, 1, 0, u['index'], 1, 0))
+    # constant buffer descriptions: the real cbuffers, then one D3D_CT_RESOURCE_BIND_INFO entry per structured
+    # buffer (named like the buffer, size = element stride) - HLSLcc takes a structured buffer's stride from it.
+    cbdefs = [(cn, (P['cbs'][cn]['size'] + 15) // 16 * 16, sorted(P['cbs'][cn]['vars'], key=lambda v: v['offset']), 0)
+              for cn in cbnames]
+    for r in res:
+        if r[1] in (5, 6, 9, 10, 11):
+            d = decls.get(('u' if r[1] != 5 else 't', r[5]))
+            stride = d[3] if d and len(d) > 3 else 4
+            cbdefs.append((r[0], stride, [dict(name='$Element', offset=0, type=None, rows=1, cols=1, isMatrix=0,
+                                               arraySize=stride // 4, size=stride, d3dtype=19)], 3))
     rb_words = 10 if (sm_major > 5 or (sm_major == 5 and sm_minor >= 1)) else 8
     off_res = hdr_words * 4
     off_cb = off_res + len(res) * rb_words * 4
-    off_vars = off_cb + len(cbnames) * 6 * 4
+    off_vars = off_cb + len(cbdefs) * 6 * 4
     var_words = 10 if is5 else 6
-    allvars = [(cn, v) for cn in cbnames for v in sorted(P['cbs'][cn]['vars'], key=lambda v: v['offset'])]
+    allvars = [(cd[0], v) for cd in cbdefs for v in cd[2]]
     off_types = off_vars + len(allvars) * var_words * 4
     type_size = 36 if is5 else 16
     off_str = off_types + len(allvars) * type_size
@@ -143,7 +165,7 @@ def build_rdef(P, sm_major, sm_minor, prog_tok, samplers_used=(), textures_used=
     def w(*a):
         out.extend(struct.pack('<%dI' % len(a), *[x & 0xffffffff for x in a]))
 
-    w(len(cbnames), off_cb if cbnames else 0, len(res), off_res if res else 0, prog_tok, 0x100)
+    w(len(cbdefs), off_cb if cbdefs else 0, len(res), off_res if res else 0, prog_tok, 0x100)
     if is5:
         w(0x31314452, 60, 24, 32, 40, 36, 12, 0)
     for (n, t, ret, dim, samp, bind, cnt, fl) in res:
@@ -151,13 +173,12 @@ def build_rdef(P, sm_major, sm_minor, prog_tok, samplers_used=(), textures_used=
         if rb_words == 10:
             w(0, 0)
     vi = 0
-    for cn in cbnames:
-        nv = len(P['cbs'][cn]['vars'])
-        size = (P['cbs'][cn]['size'] + 15) // 16 * 16
-        w(S(cn), nv, off_vars + vi * var_words * 4 if nv else 0, size, 0, 0)
+    for cn, size, vars_, cbtype in cbdefs:
+        nv = len(vars_)
+        w(S(cn), nv, off_vars + vi * var_words * 4 if nv else 0, size, 0, cbtype)
         vi += nv
     for i, (cn, v) in enumerate(allvars):
-        w(S(v['name']), v['offset'], var_size(v), 2, off_types + i * type_size, 0)
+        w(S(v['name']), v['offset'], v.get('size') or var_size(v), 2, off_types + i * type_size, 0)
         if is5:
             w(0xFFFFFFFF, 0, 0xFFFFFFFF, 0)
     for i, (cn, v) in enumerate(allvars):
@@ -167,7 +188,7 @@ def build_rdef(P, sm_major, sm_minor, prog_tok, samplers_used=(), textures_used=
             cls, rows, cols = 0, 1, 1
         else:
             cls, rows, cols = 1, 1, v['cols']
-        t = D3D_SVT.get(v['type'], 3)
+        t = v.get('d3dtype') or D3D_SVT.get(v['type'], 3)
         out.extend(struct.pack('<6H', cls, t, rows, cols, v['arraySize'], 0))
         w(0)
         if is5:
@@ -231,11 +252,62 @@ def declared_samplers(dx):
     return res
 
 
+# D3D10_SB_RESOURCE_DIMENSION -> D3D_SRV_DIMENSION
+RESDIM_SRV = {1: 1, 2: 2, 3: 4, 4: 6, 5: 8, 6: 9, 7: 3, 8: 5, 9: 7, 10: 10, 11: 11, 12: 1}
+
+
+def shex_decls(dx):
+    """SRV / UAV declarations in SHDR/SHEX: {('t'|'u', register): (D3D_SHADER_INPUT_TYPE, D3D_SRV_DIMENSION, return type)}.
+    Lets the synthesised RDEF describe each resource as what the code declares (typed / raw / structured)."""
+    data = shader_tokens(dx)
+    toks = struct.unpack_from('<%dI' % (len(data) // 4), data, 0)
+    out = {}
+    i = 2
+    while i < len(toks):
+        t = toks[i]
+        op = t & 0x7ff
+        ln = toks[i + 1] if op == 0x35 else (t >> 24) & 0x7f
+        if op in (0x58, 0xA1, 0xA2, 0x9C, 0x9D, 0x9E):
+            j = i + 1
+            if t & 0x80000000:          # extended opcode token(s)
+                while toks[j] & 0x80000000:
+                    j += 1
+                j += 1
+            opnd = toks[j]
+            j += 1
+            if opnd & 0x80000000:               # extended operand token(s)
+                while toks[j] & 0x80000000:
+                    j += 1
+                j += 1
+            reg = toks[j]
+            resdim = (t >> 11) & 0x1f
+            ret = 0
+            if op in (0x58, 0x9C) and j + 1 < len(toks):
+                ret = toks[j + 1] & 0xf          # x component return type (1 unorm .. 5 float)
+            if op == 0x58:                       # Texture*/Buffer<T>
+                out[('t', reg)] = (2, RESDIM_SRV.get(resdim, 4), ret or 5)
+            elif op == 0xA1:
+                out[('t', reg)] = (7, 11, 6)     # ByteAddressBuffer
+            elif op == 0xA2:
+                out[('t', reg)] = (5, 1, 6, toks[j + 1])     # StructuredBuffer, stride
+            elif op == 0x9C:                     # RWTexture*/RWBuffer<T>
+                out[('u', reg)] = (4, RESDIM_SRV.get(resdim, 4), ret or 5)
+            elif op == 0x9D:
+                out[('u', reg)] = (8, 11, 6)     # RWByteAddressBuffer
+            else:
+                counter = (t >> 23) & 1
+                out[('u', reg)] = (11 if counter else 6, 1, 6, toks[j + 1])   # RWStructuredBuffer (+counter), stride
+        if ln == 0:
+            break
+        i += ln
+    return out
+
+
 def prep_dxbc(code, P):
     i = code.find(b'DXBC')
     dx = code[i:]
     major, minor, ptype = dxbc_version(dx)
     tok = ({0: 0xFFFF, 1: 0xFFFE, 2: 0x4753, 3: 0x4853, 4: 0x4453, 5: 0x4353}[ptype] << 16) | (major << 8) | minor
-    rdef = build_rdef(P, major, minor, tok, samplers_used=declared_samplers(dx))
+    rdef = build_rdef(P, major, minor, tok, samplers_used=declared_samplers(dx), decls=shex_decls(dx))
     chunks = [c for c in dxbc_chunks(dx) if c[0] != b'RDEF']
     return build_dxbc([(b'RDEF', rdef)] + chunks), ptype
