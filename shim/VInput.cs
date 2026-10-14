@@ -107,8 +107,13 @@ namespace VigilShim
 
         // UnityEngine.Input throws for axes that are not in the Input Manager; the game only uses the
         // standard ones, but never let a missing axis take a frame down.
+        // On iOS Unity feeds every finger drag into the "Mouse X/Y" axes; the touch layer already turns the
+        // right fingers into VLook, so the real mouse axes would make the move-stick finger turn the camera.
+        static readonly bool s_TouchDevice = Application.isMobilePlatform;
+
         static float RealAxis(string axis, bool raw)
         {
+            if (Virtual && s_TouchDevice && axis.StartsWith("Mouse")) return 0f;
             try { return raw ? Input.GetAxisRaw(axis) : Input.GetAxis(axis); }
             catch (ArgumentException) { return 0f; }
         }
